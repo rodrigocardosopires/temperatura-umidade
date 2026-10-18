@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -26,6 +27,10 @@
 
 // Leituras e diagnóstico no Monitor Serial (115200). Comente para desativar.
 #define DEBUG
+
+// Watchdog: se o loop ficar sem alimentar o watchdog por esse tempo, a ESP32 reinicia sozinha.
+// Precisa ficar bem acima do maior bloqueio normal: ~3 s da conexão MQTT, mais o DNS se MQTT_HOST for um nome.
+const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
 
 // Configurações do Display OLED
 #define SCREEN_WIDTH 128
@@ -101,6 +106,8 @@ char topicoCmdOffsetUmid[64];
 
 bool calibracaoPendente = false;
 
+const char* motivoReinicio = "";  // publicado no HA para saber se o watchdog atuou
+
 bool publicacaoPendente = false;
 bool mqttConectadoNaTela = false;
 bool wifiConectadoNaTela = false;
@@ -126,6 +133,36 @@ const uint8_t ICONE_HOME_ASSISTANT[] PROGMEM = {
 };
 unsigned long ultimaTentativaMqtt = 0;
 unsigned long ultimaPublicacao = 0;
+
+void iniciarWatchdog() {
+  // O core já inicia o watchdog de tarefas (5 s, vigiando só a tarefa ociosa do núcleo 0);
+  // aqui ele ganha um tempo maior e passa a vigiar também o loop. A tarefa ociosa do núcleo 1
+  // não é vigiada porque o loop roda sem pausas nesse núcleo.
+  esp_task_wdt_config_t config = {
+    .timeout_ms = WATCHDOG_TIMEOUT_MS,
+    .idle_core_mask = 1 << 0,
+    .trigger_panic = true,
+  };
+  if (esp_task_wdt_reconfigure(&config) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&config);
+  }
+  esp_task_wdt_add(NULL);  // NULL = tarefa atual (a que roda setup() e loop())
+}
+
+const char* descreverMotivoReinicio(esp_reset_reason_t motivo) {
+  switch (motivo) {
+    case ESP_RST_POWERON: return "energia";
+    case ESP_RST_EXT: return "pino de reset";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "falha (panic)";
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_BROWNOUT: return "queda de tensão";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    default: return "desconhecido";
+  }
+}
 
 bool offsetsValidos(int tempDec, int umid) {
   return abs(tempDec) <= OFFSET_TEMP_LIMITE_DEC && abs(umid) <= OFFSET_UMID_LIMITE;
@@ -315,16 +352,22 @@ void publicarDescoberta() {
   publicarConfig("binary_sensor", "erro", topicoEstado,
                  "\"name\":\"Erro do sensor\",\"dev_cla\":\"problem\",\"ent_cat\":\"diagnostic\","
                  "\"val_tpl\":\"{{ 'ON' if value_json.erro else 'OFF' }}\"");
+  publicarConfig("sensor", "reinicio", topicoEstado,
+                 "\"name\":\"Motivo do último reinício\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:restart-alert\","
+                 "\"val_tpl\":\"{{ value_json.reinicio }}\"");
 }
 
 void publicarEstado() {
-  char payload[112];
+  char payload[160];
   if (sensorComErro) {
     // null deixa as entidades como "desconhecido" no HA em vez de manter o último valor
-    strcpy(payload, "{\"temperatura\":null,\"umidade\":null,\"sensacao\":null,\"erro\":true}");
+    snprintf(payload, sizeof(payload),
+             "{\"temperatura\":null,\"umidade\":null,\"sensacao\":null,\"erro\":true,\"reinicio\":\"%s\"}",
+             motivoReinicio);
   } else {
-    snprintf(payload, sizeof(payload), "{\"temperatura\":%.1f,\"umidade\":%d,\"sensacao\":%.1f,\"erro\":false}",
-             temperaturaDec / 10.0f, umidadePct, sensacaoDec / 10.0f);
+    snprintf(payload, sizeof(payload),
+             "{\"temperatura\":%.1f,\"umidade\":%d,\"sensacao\":%.1f,\"erro\":false,\"reinicio\":\"%s\"}",
+             temperaturaDec / 10.0f, umidadePct, sensacaoDec / 10.0f, motivoReinicio);
   }
   // Atualiza o horário mesmo em falha, para não republicar a cada volta do loop
   ultimaPublicacao = millis();
@@ -493,6 +536,11 @@ void desenharTela() {
 
 void setup() {
   Serial.begin(115200);
+  iniciarWatchdog();
+
+  motivoReinicio = descreverMotivoReinicio(esp_reset_reason());
+  Serial.print(F("Motivo do reinicio: "));
+  Serial.println(motivoReinicio);
 
   dht.begin();
 
@@ -518,6 +566,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
   unsigned long agora = millis();
 
   if (ultimaLeitura == 0 || agora - ultimaLeitura >= INTERVALO_LEITURA_MS) {

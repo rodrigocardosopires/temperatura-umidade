@@ -31,6 +31,7 @@ A temperatura, a umidade e a sensação térmica são exibidas localmente no dis
 - **Respeita o limite do sensor**: uma leitura a cada 2,5 s (o DHT11 aceita no máximo 1 por segundo).
 - **Detecção de falha do sensor**: após 4 leituras inválidas seguidas (~10 s), a tela mostra `ERRO SENSOR` e o Home Assistant é notificado; os valores passam a "desconhecido" em vez de congelar no último valor.
 - **Loop não bloqueante**: leitura, tela e rede rodam em paralelo via `millis()`; a tela só é redesenhada quando algo muda.
+- **Watchdog**: se o firmware travar por mais de 30 s, a ESP32 reinicia sozinha. O motivo do último reinício (energia, watchdog, queda de tensão etc.) aparece no Home Assistant.
 - **Home Assistant via MQTT Discovery**: o dispositivo e suas entidades aparecem sozinhos, sem YAML.
 - **Calibração remota**: offsets de temperatura (±10 °C) e umidade (±20 %) editáveis no Home Assistant e salvos na flash da ESP32.
 - **Funciona offline**: sem Wi-Fi ou sem broker, a leitura e o display continuam operando normalmente.
@@ -128,6 +129,30 @@ flowchart TD
 | Reconexão MQTT | 10 s (quando desconectado) | `manterMqtt()` |
 | Publicação de estado | ao mudar (mín. 2 s) + a cada 60 s | `publicarEstado()` |
 | Redesenho da tela | somente quando algo muda | `desenharTela()` |
+| Alimentação do watchdog | a cada volta do loop | `esp_task_wdt_reset()` |
+
+### Watchdog
+
+A ESP32 tem um *Task Watchdog* (TWDT) de hardware. O core Arduino já o liga, mas por padrão ele só vigia a tarefa ociosa do núcleo 0, e não o `loop()`. Na `iniciarWatchdog()`, chamada no início do `setup()`, o firmware:
+
+1. reconfigura o tempo limite para `WATCHDOG_TIMEOUT_MS` (30 s), mantendo o *panic* (reinício) ao estourar;
+2. inscreve a tarefa do `setup()`/`loop()` no watchdog;
+3. passa a alimentá-lo com `esp_task_wdt_reset()` no começo de cada volta do `loop()`.
+
+```mermaid
+flowchart LR
+    loopVolta["volta do loop"] --> alimenta["esp_task_wdt_reset"]
+    alimenta --> tarefas["leitura, MQTT, tela"]
+    tarefas --> loopVolta
+    tarefas -. "travou por mais de 30 s" .-> estouro["watchdog estoura"]
+    estouro --> panic["panic: backtrace no Serial"]
+    panic --> reboot["ESP32 reinicia"]
+    reboot --> motivo["setup le esp_reset_reason e publica no HA"]
+```
+
+O tempo de 30 s fica bem acima do maior bloqueio normal do loop (até ~3 s na tentativa de conexão MQTT, mais a resolução DNS caso `MQTT_HOST` seja um nome). Um loop saudável alimenta o watchdog milhares de vezes por segundo.
+
+O watchdog **não** reinicia a placa quando o Wi-Fi ou o broker caem, porque nesse caso o loop continua rodando e reconectando normalmente. Ele age só quando o firmware realmente para (laço infinito, deadlock, biblioteca travada).
 
 ### Tela OLED
 
@@ -223,10 +248,25 @@ Dispositivo: **Temperatura e Umidade** (modelo `ESP32 DevKit V1 + DHT11`, com a 
 | Umidade | `sensor` (humidity) | % | - |
 | Sensação térmica | `sensor` (temperature) | °C | - |
 | Erro do sensor | `binary_sensor` (problem) | - | Diagnóstico |
+| Motivo do último reinício | `sensor` (texto) | - | Diagnóstico |
 | Ajuste de temperatura | `number` (-10 a 10, passo 0,1) | °C | Configuração |
 | Ajuste de umidade | `number` (-20 a 20, passo 1) | % | Configuração |
 
 Os sensores usam `state_class: measurement`, então entram nas **estatísticas de longo prazo** e nos gráficos do Home Assistant.
+
+Valores possíveis de **Motivo do último reinício**:
+
+| Valor | Significado |
+|---|---|
+| `energia` | Placa ligada, religada na tomada/USB ou botão **EN** pressionado (no ESP32 o EN equivale a religar) |
+| `pino de reset` | Reset externo (raro no ESP32 DevKit) |
+| `software` | Reinício pedido pelo próprio firmware (ex.: após gravação) |
+| `watchdog` | O firmware travou e o watchdog reiniciou a placa |
+| `falha (panic)` | Erro fatal (exceção, acesso inválido à memória) |
+| `queda de tensão` | *Brownout*: a alimentação caiu abaixo do mínimo |
+| `deep sleep` / `desconhecido` | Outros casos |
+
+> Dica: crie uma automação no Home Assistant que avise quando o valor for `watchdog`, `falha (panic)` ou `queda de tensão`.
 
 ### Tópicos MQTT
 
@@ -235,8 +275,8 @@ Os sensores usam `state_class: measurement`, então entram nas **estatísticas d
 | Tópico | Direção | Retido | Conteúdo |
 |---|---|---|---|
 | `<id>/status` | ESP32 → broker | sim | `online` / `offline` (LWT) |
-| `<id>/estado` | ESP32 → broker | sim | `{"temperatura":26.5,"umidade":60,"sensacao":26.8,"erro":false}` |
-| `<id>/estado` (em falha) | ESP32 → broker | sim | `{"temperatura":null,"umidade":null,"sensacao":null,"erro":true}` |
+| `<id>/estado` | ESP32 → broker | sim | `{"temperatura":26.5,"umidade":60,"sensacao":26.8,"erro":false,"reinicio":"energia"}` |
+| `<id>/estado` (em falha) | ESP32 → broker | sim | `{"temperatura":null,"umidade":null,"sensacao":null,"erro":true,"reinicio":"energia"}` |
 | `<id>/calibracao` | ESP32 → broker | sim | `{"offset_temp":0.0,"offset_umid":0}` |
 | `<id>/calibracao/offset_temp/set` | HA → ESP32 | não | número em °C (ex.: `-1.5`) |
 | `<id>/calibracao/offset_umid/set` | HA → ESP32 | não | número inteiro em % (ex.: `5`) |
@@ -370,6 +410,7 @@ Todos no início do `TempHumid.ino`:
 | `INTERVALO_MIN_PUBLICACAO_MS` | 2 s | Intervalo mínimo entre publicações MQTT |
 | `INTERVALO_HEARTBEAT_MS` | 60 s | Republicação periódica do estado |
 | `TIMEOUT_CONEXAO_MQTT_MS` | 1 s | Tempo máximo da conexão TCP com o broker |
+| `WATCHDOG_TIMEOUT_MS` | 30 s | Tempo sem alimentar o watchdog até reiniciar a placa |
 | `VERSAO_FIRMWARE` | `1.0.0` | Versão exibida nas informações do dispositivo no Home Assistant |
 | `DEBUG` | ativo | Logs no Monitor Serial |
 
@@ -392,6 +433,8 @@ Todos no início do `TempHumid.ino`:
 | `rc=5` | Usuário/senha MQTT incorretos | Conferir `secrets.h` e o usuário no HA |
 | `rc=-2` | Broker inacessível | Conferir `MQTT_HOST` e se o Mosquitto está rodando |
 | Ajuste no HA volta ao valor anterior | Valor fora dos limites | Usar -10 a 10 °C e -20 a 20 % |
+| "Motivo do último reinício" = `watchdog` | O firmware travou | Ver o backtrace (`task_wdt`) no Monitor Serial logo antes do reinício |
+| "Motivo do último reinício" = `queda de tensão` | Fonte fraca ou cabo USB ruim | Trocar a fonte/cabo; o pico de corrente do Wi-Fi derruba fontes fracas |
 
 ---
 
@@ -418,9 +461,10 @@ Todos no início do `TempHumid.ino`:
 
 - **Precisão do DHT11**: ±2 °C e ±5 % de umidade, faixa de 0 a 50 °C e 20 a 90 %. Os offsets corrigem o erro fixo, mas não o erro que varia com a temperatura.
 - **Sensação térmica só para calor**: o índice de calor não considera vento nem frio (*wind chill*); em temperaturas amenas ele é igual à temperatura.
-- **Conexão MQTT bloqueante**: cada tentativa de reconexão pode travar o loop por até ~3 s (1 s de TCP + 2 s esperando o broker) enquanto o broker estiver inacessível. Nesse intervalo a tela não é atualizada.
+- **Conexão MQTT bloqueante**: cada tentativa de reconexão pode travar o loop por até ~3 s (1 s de TCP + 2 s esperando o broker) enquanto o broker estiver inacessível. Nesse intervalo a tela não é atualizada. Fica bem abaixo dos 30 s do watchdog.
+- **Watchdog só detecta travamento total**: se o loop continuar rodando mas em estado errado, o watchdog não age. Sensor sem resposta é coberto pela detecção de falha (`ERRO SENSOR`), mas um sensor que devolva sempre o mesmo valor válido não é detectado.
 - **MQTT sem TLS**: as credenciais trafegam em texto puro na rede local.
-- **Sem atualização pelo Wi-Fi (OTA)**: a gravação é só pela USB. O esquema de partição padrão já tem duas partições de aplicação de 1,25 MB e a firmware ocupa ~72% de cada uma, então dá para adicionar `ArduinoOTA` sem trocar a partição.
+- **Sem atualização pelo Wi-Fi (OTA)**: a gravação é só pela USB. O esquema de partição padrão já tem duas partições de aplicação de 1,25 MB e a firmware ocupa ~73% de cada uma, então dá para adicionar `ArduinoOTA` sem trocar a partição.
 - **Display dimensionado para o DHT11**: o termômetro gráfico vai de 0 a 50 °C. Valores de 5 caracteres na linha principal (ex.: `-10.0`, possível com offset negativo perto de 0 °C) são mostrados sem a casa decimal para não invadir o termômetro.
 - Ideias: suporte a DHT22/SHT31/BME280 por configuração, ponto de orvalho, mínima/máxima do dia, desligar o display à noite, OTA.
 
