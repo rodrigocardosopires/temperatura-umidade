@@ -1,0 +1,46 @@
+name: Compilar
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compilar:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variante: placa
+            defines: ""
+          - variante: wokwi
+            defines: "-DWOKWI"
+
+    steps:
+      # A Arduino IDE exige que a pasta tenha o mesmo nome do .ino
+      - uses: actions/checkout@v4
+        with:
+          path: TempHumid
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Instalar o core ESP32
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Instalar bibliotecas
+        run: |
+          arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO" \
+            "DHT sensor library" "Adafruit Unified Sensor" "PubSubClient"
+
+      - name: Compilar (${{ matrix.variante }})
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32doit-devkit-v1 \
+            --build-property "build.defines=${{ matrix.defines }}" \
+            --output-dir build TempHumid
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.variante }}
+          path: build/*.bin
